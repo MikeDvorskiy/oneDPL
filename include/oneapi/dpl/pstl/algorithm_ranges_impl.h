@@ -120,23 +120,57 @@ __pattern_transform(__serial_tag</*IsVector*/std::false_type>, _ExecutionPolicy&
 // pattern_find_if
 //---------------------------------------------------------------------------------------------------------------------
 
-template <typename _Tag, typename _ExecutionPolicy, typename _R, typename _Proj, typename _Pred>
-std::ranges::borrowed_iterator_t<_R>
-__pattern_find_if(_Tag __tag, _ExecutionPolicy&& __exec, _R&& __r, _Pred __pred, _Proj __proj)
+template <typename _It, typename _Pred>
+_It
+__brick_find_if(std::ranges::subrange<_It> __sr, _Pred __pred, /*is_vector=*/std::false_type) noexcept
 {
-    static_assert(__is_parallel_tag_v<_Tag> || typename _Tag::__is_vector{});
+    return std::ranges::find_if(std::move(__sr), __pred);
+}
 
-    return oneapi::dpl::__internal::__pattern_find_if(
-        __tag, std::forward<_ExecutionPolicy>(__exec), std::ranges::begin(__r),
-        std::ranges::begin(__r) + std::ranges::size(__r),
-        oneapi::dpl::__internal::__unary_op<_Pred, _Proj>{__pred, __proj});
+template <typename _It, typename _Pred>
+_It
+__brick_find_if(std::ranges::subrange<_It> __sr, _Pred __pred, /*is_vector=*/std::true_type) noexcept
+{
+    auto __first = std::ranges::begin(__sr);
+    using _SizeType = std::ranges::range_difference_t<std::ranges::subrange<_It>>;
+    return __unseq_backend::__simd_first(__first, _SizeType(0), static_cast<_SizeType>(std::ranges::size(__sr)),
+                                         oneapi::dpl::__internal::__pred_at_index{__pred});
 }
 
 template <typename _ExecutionPolicy, typename _R, typename _Proj, typename _Pred>
 std::ranges::borrowed_iterator_t<_R>
 __pattern_find_if(__serial_tag</*IsVector*/ std::false_type>, _ExecutionPolicy&&, _R&& __r, _Pred __pred, _Proj __proj)
 {
-    return std::ranges::find_if(std::forward<_R>(__r), __pred, __proj);
+    auto __first = std::ranges::begin(__r);
+    return __brick_find_if(std::ranges::subrange(__first, __first + std::ranges::size(__r)),
+                           oneapi::dpl::__internal::__unary_op<_Pred, _Proj>{__pred, __proj}, std::false_type{});
+}
+
+template <typename _ExecutionPolicy, typename _R, typename _Proj, typename _Pred>
+std::ranges::borrowed_iterator_t<_R>
+__pattern_find_if(__serial_tag</*IsVector*/ std::true_type>, _ExecutionPolicy&&, _R&& __r, _Pred __pred, _Proj __proj)
+{
+    auto __first = std::ranges::begin(__r);
+    return __brick_find_if(std::ranges::subrange(__first, __first + std::ranges::size(__r)),
+                           oneapi::dpl::__internal::__unary_op<_Pred, _Proj>{__pred, __proj}, std::true_type{});
+}
+
+template <class _IsVector, typename _ExecutionPolicy, typename _R, typename _Pred, typename _Proj>
+std::ranges::borrowed_iterator_t<_R>
+__pattern_find_if(__parallel_tag<_IsVector> __tag, _ExecutionPolicy&& __exec, _R&& __r, _Pred __pred, _Proj __proj)
+{
+    auto __first = std::ranges::begin(__r);
+    auto __last = __first + std::ranges::size(__r);
+    oneapi::dpl::__internal::__unary_op<_Pred, _Proj> __unary_op{__pred, __proj};
+
+    return oneapi::dpl::__internal::__except_handler([&]() {
+        return oneapi::dpl::__internal::__parallel_find(
+            __tag, std::forward<_ExecutionPolicy>(__exec), __first, __last,
+            [__unary_op](auto __i, auto __j) {
+                return __brick_find_if(std::ranges::subrange(__i, __j), __unary_op, _IsVector{});
+            },
+            std::true_type{});
+    });
 }
 
 //---------------------------------------------------------------------------------------------------------------------
