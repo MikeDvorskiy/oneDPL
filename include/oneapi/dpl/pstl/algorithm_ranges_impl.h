@@ -141,7 +141,7 @@ __pattern_find_if(__parallel_tag<_IsVector> __tag, _ExecutionPolicy&& __exec, _R
 {
     return __except_handler([&]() {
         return __parallel_find(
-            __tag, std::forward<_ExecutionPolicy>(__exec), std::forward<_ExecutionPolicy>(__exec), std::ranges::begin(__r),
+            __tag, std::forward<_ExecutionPolicy>(__exec), std::ranges::begin(__r),
             std::ranges::begin(__r) + std::ranges::size(__r),
             [__pred, __proj](auto __i, auto __j) {
                 return __brick_find_if(std::ranges::subrange(__i, __j), __pred, __proj, _IsVector{});
