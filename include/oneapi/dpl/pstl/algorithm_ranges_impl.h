@@ -147,7 +147,7 @@ __pattern_find_if(__parallel_tag<_IsVector> __tag, _ExecutionPolicy&& __exec, _R
                 return __brick_find_if(std::ranges::subrange(__i, __j), __pred, __proj, _IsVector{});
             },
             ::std::true_type{});
-    });    
+    });
 }
 
 template <typename _IsVector, typename _ExecutionPolicy, typename _R, typename _Proj, typename _Pred>
