@@ -119,14 +119,14 @@ __pattern_transform(__serial_tag</*IsVector*/std::false_type>, _ExecutionPolicy&
 //---------------------------------------------------------------------------------------------------------------------
 // pattern_find_if
 //---------------------------------------------------------------------------------------------------------------------
-template <typename _ExecutionPolicy, typename _R, typename _Proj, typename _Pred>
+template <typename _R, typename _Proj, typename _Pred>
 std::ranges::borrowed_iterator_t<_R>
 __brick_find_if(_R&& __r, _Pred __pred, _Proj __proj, /*is_vector=*/::std::false_type) noexcept
 {
     return std::ranges::find_if(std::forward<_R>(__r), __pred, __proj);
 }
 
-template <typename _ExecutionPolicy, typename _R, typename _Proj, typename _Pred>
+template <typename _R, typename _Proj, typename _Pred>
 std::ranges::borrowed_iterator_t<_R>
 __brick_find_if(_R&& __r, _Pred __pred, _Proj __proj, /*is_vector=*/::std::true_type) noexcept
 {
