@@ -1,0 +1,130 @@
+name: CPU,bknd=dpcpp,cmplr=icpx,ubuntu-latest,std=с++20,cfg=RelWithAsserts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+    paths:
+      - '.github/**/*'
+      - 'cmake/**/*'
+      - 'include/**/*'
+      - 'test/**/*'
+      - 'CMakeLists.txt'
+      - '.clang-format'
+      - 'examples/**/*'
+  workflow_dispatch:
+
+permissions: read-all
+
+env:
+  BUILD_CONCURRENCY: 4
+  TEST_TIMEOUT: 360
+  LINUX_ONEAPI_PATH: /opt/intel/oneapi
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ !contains(github.ref, 'refs/heads/main') }}
+
+jobs:
+  linux-testing:
+    name: CPU,bknd=dpcpp,cmplr=icpx,ubuntu-latest,std=с++20,cfg=RelWithAsserts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Intel APT repository
+        run: |
+          # https://www.intel.com/content/www/us/en/docs/oneapi/installation-guide-linux/2024-0/apt.html
+          success=false
+          for i in 1 2 3 4 5; do
+            if wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null; then
+              success=true
+              break
+            fi
+            if [ "$i" -lt 5 ]; then
+              echo "Attempt $i failed, retrying in 10s..."
+              sleep 10
+            else
+              echo "Attempt $i failed; no more retries left."
+            fi
+          done
+          if [ "$success" = false ]; then
+            echo "Failed to download Intel GPG key after 5 attempts"
+            exit 1
+          fi
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update -y
+      - name: Install Intel® oneAPI Threading Building Blocks
+        run: |
+          sudo apt-get install intel-oneapi-tbb-devel -y
+      - name: Install Intel® oneAPI DPC++/C++ Compiler
+        run: |
+          sudo apt-get install intel-oneapi-compiler-dpcpp-cpp -y
+          # Avoid accidental use of a released version, keeping libpstloffload.so
+          sudo rm -rf ${LINUX_ONEAPI_PATH}/dpl/latest/include
+      - name: Run testing
+        shell: bash
+        run: |
+          set -x
+          if [[ -f "${LINUX_ONEAPI_PATH}/setvars.sh" ]]; then
+            source ${LINUX_ONEAPI_PATH}/setvars.sh
+          fi
+
+          # build and run the examples
+          example_dirs=()
+          for example_dir in ${GITHUB_WORKSPACE}/examples/*; do
+            if [[ -d "$example_dir" && -f "$example_dir/CMakeLists.txt" ]]; then
+              example_dirs+=("$example_dir")
+            fi
+          done
+          for example_dir in "${example_dirs[@]}"; do
+            cd "$example_dir"
+            mkdir build && cd build
+            cmake -DCMAKE_BUILD_TYPE=RelWithAsserts -DCMAKE_CXX_STANDARD=20 -DCMAKE_CXX_COMPILER=icpx ..
+            make VERBOSE=1 |& tee build.log
+            ctest --timeout ${TEST_TIMEOUT} --output-on-failure |& tee ctest.log
+          done
+
+          # set targets for dpcpp tests
+          make_targets="build-onedpl-general-tests build-onedpl-sycl_iterator-tests build-onedpl-implementation_details-tests"
+          tests_regex="(sycl_iterator_.*)|(device_copyable)|(dpl_namespace)|(test_policies)|(lambda_naming)|(host_device_storage)"
+          make_targets+=" build-onedpl-ranges-tests"
+          tests_regex+="|(std_ranges_.*)"
+          ctest_flags="-R ${tests_regex}\.pass"
+
+          cd ${GITHUB_WORKSPACE}
+          mkdir build && cd build
+          lscpu
+
+          # TODO: fix or justify the excluded warnings
+          EXTRA_CXX_FLAGS="-Wall -Wextra-semi -Werror -Wno-error=sign-compare"
+          # Reduce std_ranges view-type permutations in per-commit CI to keep
+          # build time under the job limit. A couple of representative tests
+          # force full coverage back on regardless of this flag.
+          EXTRA_CXX_FLAGS="${EXTRA_CXX_FLAGS} -DONEDPL_STD_RANGES_TEST_ALL_PERMUTATIONS=0"
+          EXTRA_CXX_FLAGS="${EXTRA_CXX_FLAGS} -Wno-error=pass-failed"
+          EXTRA_CXX_FLAGS="${EXTRA_CXX_FLAGS} -Wno-error=recommended-option"
+
+          cmake -DCMAKE_CXX_STANDARD=20 -DCMAKE_BUILD_TYPE=RelWithAsserts \
+            -DCMAKE_CXX_COMPILER=icpx -DONEDPL_BACKEND=dpcpp -DCMAKE_CXX_FLAGS="${EXTRA_CXX_FLAGS}" ..
+          make VERBOSE=1 -j${BUILD_CONCURRENCY} ${make_targets} |& tee build.log
+          ONEAPI_DEVICE_SELECTOR=*:cpu
+          ctest --timeout ${TEST_TIMEOUT} --output-on-failure ${ctest_flags} |& tee ctest.log
+
+          # Generate a summary
+          os_name=$(uname -a | head -n 1)
+          cmake_version=$(cmake --version | head -n 1)
+          compiler_version=$(icpx --version | head -n 1)
+          cpu_model=$(lscpu | grep "Model name")
+          python ${GITHUB_WORKSPACE}/.github/scripts/job_summary.py --build-log build.log \
+                                                                    --ctest-log ctest.log \
+                                                                    --output-file summary.md \
+                                                                    --os "${os_name}" \
+                                                                    --cmake-version "${cmake_version}" \
+                                                                    --compiler-version "${compiler_version}" \
+                                                                    --cpu-model "${cpu_model}"
+          cat summary.md > $GITHUB_STEP_SUMMARY
