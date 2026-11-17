@@ -981,6 +981,14 @@ struct __parallel_find_forward_tag
     {
         __found = std::min(__found, __new_state);
     }
+
+    // A work-item at position __idx (moving forward) cannot improve the global state once it holds a smaller index
+    template <typename _SrcDataIdx>
+    static bool
+    __is_superseded(_AtomicType __global_state, _SrcDataIdx __idx)
+    {
+        return static_cast<_SrcDataIdx>(__global_state) < __idx;
+    }
 };
 
 // Tag for __parallel_find_or to find the last element that satisfies predicate
@@ -1019,6 +1027,15 @@ struct __parallel_find_backward_tag
     {
         __found = std::max(__found, __new_state);
     }
+
+    // A work-item at position __idx (moving backward) cannot improve the global state once it holds a greater index
+    template <typename _SrcDataIdx>
+    static bool
+    __is_superseded(_AtomicType __global_state, _SrcDataIdx __idx)
+    {
+        static_assert(std::is_signed_v<_AtomicType>, "The initial state -1 requires a signed type");
+        return __global_state >= 0 && static_cast<_SrcDataIdx>(__global_state) > __idx;
+    }
 };
 
 // Tag for __parallel_find_or for or-semantic
@@ -1051,6 +1068,14 @@ struct __parallel_or_tag
     {
         __found = __found_state;
     }
+
+    // Any found match makes further search useless
+    template <typename _SrcDataIdx>
+    static bool
+    __is_superseded(_AtomicType __global_state, _SrcDataIdx /*__idx*/)
+    {
+        return __global_state == __found_state;
+    }
 };
 
 template <typename _RangeType>
@@ -1071,53 +1096,121 @@ __is_backward_tag(_TagType)
 // early_exit (find_or)
 //------------------------------------------------------------------------
 
+// How often (in iterations) work-items check the state shared between work-groups
+inline constexpr std::size_t __find_or_global_state_poll_period = 128;
+
 template <typename _Pred>
 struct __early_exit_find_or
 {
     _Pred __pred;
 
+    // __global_state is either a pointer to the state shared between all work-groups or nullptr (single work-group).
+    // When it is provided, a found state is published to it immediately and it is polled periodically, so that
+    // work-groups stop as soon as their remaining work cannot improve the result.
     template <typename _NDItemId, typename _SrcDataSize, typename _IterationDataSize, typename _LocalFoundState,
-              typename _BrickTag, typename... _Ranges>
+              typename _GlobalStatePtr, typename _BrickTag, typename... _Ranges>
     void
     operator()(const _NDItemId __item, const _SrcDataSize __source_data_size, const std::size_t __iters_per_work_item,
-               const _IterationDataSize __iteration_data_size, _LocalFoundState& __found_local, _BrickTag __brick_tag,
-               _Ranges&&... __rngs) const
+               const _IterationDataSize __iteration_data_size, _LocalFoundState& __found_local,
+               _GlobalStatePtr __global_state, _BrickTag __brick_tag, _Ranges&&... __rngs) const
     {
+        constexpr bool __has_global_state = !std::is_same_v<_GlobalStatePtr, std::nullptr_t>;
+
         // Return the index of this item in the kernel's execution range
         const auto __global_id = __item.get_global_linear_id();
 
+        // The iterations are processed in blocks; the global state is polled before each block.
+        // Polling is kept out of the inner loop: having it there slows down the full scan.
+        // Without the global state all the iterations form a single block.
+        const std::size_t __block_size =
+            __has_global_state ? __find_or_global_state_poll_period : __iters_per_work_item;
+
         bool __something_was_found = false;
-        for (_SrcDataSize __i = 0; !__something_was_found && __i < __iters_per_work_item; ++__i)
+        for (std::size_t __block_begin = 0; !__something_was_found && __block_begin < __iters_per_work_item;
+             __block_begin += __block_size)
         {
-            auto __local_src_data_idx = __i;
-            if constexpr (__is_backward_tag(__brick_tag))
-                __local_src_data_idx = __iters_per_work_item - 1 - __i;
-
-            const auto __src_data_idx_current = __global_id + __local_src_data_idx * __iteration_data_size;
-            if (__src_data_idx_current < __source_data_size && __pred(__src_data_idx_current, __rngs...))
+            if constexpr (__has_global_state)
             {
-                // Update local found state
-                _BrickTag::__save_state_to(__found_local, __src_data_idx_current);
+                // The position of the first iteration of the block is the best one remaining for this work-item:
+                // the smallest index for the forward search and the greatest index for the backward search
+                auto __local_src_data_idx = __block_begin;
+                if constexpr (__is_backward_tag(__brick_tag))
+                    __local_src_data_idx = __iters_per_work_item - 1 - __block_begin;
+                const auto __src_data_idx_block = __global_id + __local_src_data_idx * __iteration_data_size;
 
-                // This break is mandatory from the performance point of view.
-                // This break is safe for all our cases:
-                // 1) __parallel_find_forward_tag : when we search for the first matching data entry,
-                //    we process data from start to end (forward direction).
-                //    This means that after first found entry there is no reason to process data anymore.
-                // 2) __parallel_find_backward_tag : when we search for the last matching data entry,
-                //    we process data from end to start (backward direction).
-                //    This means that after the first found entry there is no reason to process data anymore too.
-                // 3) __parallel_or_tag : when we search for any matching data entry,
-                //    we process data from start to end (forward direction).
-                //    This means that after the first found entry there is no reason to process data anymore too.
-                // But break statement here shows poor perf in some cases.
-                // So we use bool variable state check in the for-loop header.
-                __something_was_found = true;
+                using _AtomicType = std::remove_pointer_t<_GlobalStatePtr>;
+                auto __sub_group = __item.get_sub_group();
+
+                // A single work-item per sub-group reads the global state to reduce contention on it
+                const bool __is_reader = __sub_group.get_local_linear_id() == 0;
+                _AtomicType __global_state_value{};
+                if (__is_reader)
+                {
+                    __dpl_sycl::__atomic_ref<_AtomicType, sycl::access::address_space::global_space> __global_ref(
+                        *__global_state);
+                    __global_state_value = __global_ref.load();
+                }
+
+                // Stop the sub-group only if none of its work-items can improve the global state:
+                // the decision stays uniform within the sub-group and a better result cannot be missed
+                if constexpr (std::is_same_v<_BrickTag, __parallel_or_tag>)
+                {
+                    // The decision does not depend on the position: the reader's view is shared with a vote
+                    __something_was_found = __dpl_sycl::__any_of_group(
+                        __sub_group,
+                        __is_reader && _BrickTag::__is_superseded(__global_state_value, __src_data_idx_block));
+                }
+                else
+                {
+                    __global_state_value = __dpl_sycl::__group_broadcast(__sub_group, __global_state_value);
+                    __something_was_found = __dpl_sycl::__all_of_group(
+                        __sub_group, _BrickTag::__is_superseded(__global_state_value, __src_data_idx_block));
+                }
             }
 
-            // Share found into state between items in our sub-group to early exit if something was found
-            //  - the update of __found_local state isn't required here because it updates later on the caller side
-            __something_was_found = __dpl_sycl::__any_of_group(__item.get_sub_group(), __something_was_found);
+            const std::size_t __block_end = std::min(__block_begin + __block_size, __iters_per_work_item);
+            for (_SrcDataSize __i = __block_begin; !__something_was_found && __i < __block_end; ++__i)
+            {
+                auto __local_src_data_idx = __i;
+                if constexpr (__is_backward_tag(__brick_tag))
+                    __local_src_data_idx = __iters_per_work_item - 1 - __i;
+
+                const auto __src_data_idx_current = __global_id + __local_src_data_idx * __iteration_data_size;
+                if (__src_data_idx_current < __source_data_size && __pred(__src_data_idx_current, __rngs...))
+                {
+                    // Update local found state
+                    _BrickTag::__save_state_to(__found_local, __src_data_idx_current);
+
+                    // Publish the found state to the other work-groups right away
+                    if constexpr (__has_global_state)
+                    {
+                        using _AtomicType = std::remove_pointer_t<_GlobalStatePtr>;
+                        __dpl_sycl::__atomic_ref<_AtomicType, sycl::access::address_space::global_space> __global_ref(
+                            *__global_state);
+                        _BrickTag::__save_state_to_atomic(__global_ref, __src_data_idx_current);
+                    }
+
+                    // This break is mandatory from the performance point of view.
+                    // This break is safe for all our cases:
+                    // 1) __parallel_find_forward_tag : when we search for the first matching data entry,
+                    //    we process data from start to end (forward direction).
+                    //    This means that after first found entry there is no reason to process data anymore.
+                    // 2) __parallel_find_backward_tag : when we search for the last matching data entry,
+                    //    we process data from end to start (backward direction).
+                    //    This means that after the first found entry there is no reason to process data anymore too.
+                    // 3) __parallel_or_tag : when we search for any matching data entry,
+                    //    we process data from start to end (forward direction).
+                    //    This means that after the first found entry there is no reason to process data anymore too.
+                    // But break statement here shows poor perf in some cases.
+                    // So we use bool variable state check in the for-loop header.
+                    __something_was_found = true;
+                }
+
+                // Share found into state between items in our sub-group to early exit if something was found
+                //  - the update of __found_local state isn't required here because it updates later on the caller
+                //    side
+                __something_was_found = __dpl_sycl::__any_of_group(__item.get_sub_group(), __something_was_found);
+            }
         }
     }
 };
@@ -1228,8 +1321,8 @@ struct __parallel_find_or_impl_one_wg<__or_tag_check, __internal::__optional_ker
                     //    1) if no element satisfies pred;
                     //    2) early exit from sub-group occurred: in this case the state of __found_local
                     //       will updated in the next group operation (3)
-                    __pred(__item, __rng_n, __iters_per_work_item, __wgroup_size, __found_local, __brick_tag,
-                           __rngs...);
+                    __pred(__item, __rng_n, __iters_per_work_item, __wgroup_size, __found_local,
+                           /*__global_state*/ nullptr, __brick_tag, __rngs...);
 
                     // 3. Reduce over group: find sycl::minimum (for the __parallel_find_forward_tag),
                     // find sycl::maximum (for the __parallel_find_backward_tag)
@@ -1318,7 +1411,7 @@ struct __parallel_find_or_impl_multiple_wgs<__or_tag_check, __internal::__option
                     //    2) early exit from sub-group occurred: in this case the state of __found_local
                     //       will updated in the next group operation (3)
                     __pred(__item, __rng_n, __iters_per_work_item, __n_groups * __wgroup_size, __found_local,
-                           __brick_tag, __rngs...);
+                           __scratch_acc_rw.__data(), __brick_tag, __rngs...);
 
                     // 3. Reduce over group: find sycl::minimum (for the __parallel_find_forward_tag),
                     // find sycl::maximum (for the __parallel_find_backward_tag)
