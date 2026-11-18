@@ -32,6 +32,7 @@
 #include "memory_impl.h"
 #include "parallel_backend_utils.h"
 #include "unseq_backend_simd.h"
+#include "unseq_backend_simd_sort.h"
 
 #include "parallel_backend.h"
 #include "parallel_impl.h"
@@ -2534,6 +2535,76 @@ __pattern_partition_copy(__parallel_tag<_IsVector>, _ExecutionPolicy&& __exec, _
 // sort
 //------------------------------------------------------------------------
 
+// Parallel SIMD sort of integral keys: the chunks are sorted by the SIMD brick in parallel, then merged pairwise
+// by the backend parallel merge with the SIMD merge brick, alternating between the data and a buffer
+template <class _IsVector, class _ExecutionPolicy, typename _Tp, typename _Order>
+void
+__parallel_simd_sort(__parallel_tag<_IsVector>, _ExecutionPolicy&& __exec, _Tp* __data, std::size_t __n, _Order __order)
+{
+    using __backend_tag = typename __parallel_tag<_IsVector>::__backend_tag;
+
+    // Keys sorted by one task: together with its scratch space, a chunk fits in the L2 cache
+    constexpr std::size_t __chunk = std::size_t(1) << 16;
+    if (__n <= __chunk)
+    {
+        __unseq_backend::__simd_sort(__data, __n, __order);
+        return;
+    }
+
+    __par_backend::__buffer<_Tp> __buf(__n);
+    _Tp* __tmp = __buf.get();
+
+    // 1. Sort the chunks; each one uses the matching part of the buffer as scratch space
+    __par_backend::__parallel_for(__backend_tag{}, __exec, std::size_t(0), __dpl_ceiling_div(__n, __chunk),
+                                  [__data, __tmp, __n, __order](std::size_t __i, std::size_t __j) {
+                                      for (std::size_t __k = __i; __k < __j; ++__k)
+                                      {
+                                          const std::size_t __begin = __k * __chunk;
+                                          const std::size_t __end = std::min(__n, __begin + __chunk);
+                                          __unseq_backend::__simd_sort(__data + __begin, __end - __begin,
+                                                                       __tmp + __begin, __order);
+                                      }
+                                  });
+
+    // 2. Merge the sorted runs pairwise, doubling their length
+    _Tp* __src = __data;
+    _Tp* __dst = __tmp;
+    for (std::size_t __len = __chunk; __len < __n; __len *= 2)
+    {
+        __par_backend::__parallel_for(
+            __backend_tag{}, __exec, std::size_t(0), __dpl_ceiling_div(__n, 2 * __len),
+            [__src, __dst, __n, __len, __order, &__exec](std::size_t __i, std::size_t __j) {
+                for (std::size_t __k = __i; __k < __j; ++__k)
+                {
+                    const std::size_t __begin = __k * 2 * __len;
+                    const std::size_t __mid = std::min(__n, __begin + __len);
+                    const std::size_t __end = std::min(__n, __begin + 2 * __len);
+                    if (__mid == __end)
+                    {
+                        std::memcpy(__dst + __begin, __src + __begin, (__end - __begin) * sizeof(_Tp));
+                        continue;
+                    }
+                    __par_backend::__parallel_merge(
+                        __backend_tag{}, __exec, __src + __begin, __src + __mid, __src + __mid, __src + __end,
+                        __dst + __begin, __order,
+                        [__order](_Tp* __xs, _Tp* __xe, _Tp* __ys, _Tp* __ye, _Tp* __zs, _Order) {
+                            __unseq_backend::__simd_merge(__xs, __xe - __xs, __ys, __ye - __ys, __zs, __order);
+                        });
+                }
+            });
+        std::swap(__src, __dst);
+    }
+
+    // 3. The result is in the buffer after an odd number of merge rounds
+    if (__src != __data)
+    {
+        __par_backend::__parallel_for(__backend_tag{}, __exec, std::size_t(0), __n,
+                                      [__src, __data](std::size_t __i, std::size_t __j) {
+                                          std::memcpy(__data + __i, __src + __i, (__j - __i) * sizeof(_Tp));
+                                      });
+    }
+}
+
 template <class _Tag, class _ExecutionPolicy, class _RandomAccessIterator, class _Compare, class _LeafSort>
 void
 __pattern_sort(_Tag, _ExecutionPolicy&&, _RandomAccessIterator __first, _RandomAccessIterator __last, _Compare __comp,
@@ -2541,24 +2612,47 @@ __pattern_sort(_Tag, _ExecutionPolicy&&, _RandomAccessIterator __first, _RandomA
 {
     static_assert(__is_serial_tag_v<_Tag> || __is_parallel_forward_tag_v<_Tag>);
 
-    __leaf_sort(__first, __last, __comp);
+    if constexpr (typename _Tag::__is_vector{} &&
+                  __unseq_backend::__is_simd_sort_applicable<_RandomAccessIterator, _Compare>())
+    {
+        using _Tp = typename std::iterator_traits<_RandomAccessIterator>::value_type;
+        using _Order = typename __unseq_backend::__simd_sort_order_of<_Compare, _Tp>::type;
+        __unseq_backend::__simd_sort(__unseq_backend::__simd_sort_to_address(__first), __last - __first, _Order{});
+    }
+    else
+    {
+        __leaf_sort(__first, __last, __comp);
+    }
 }
 
 template <class _IsVector, class _ExecutionPolicy, class _RandomAccessIterator, class _Compare, class _LeafSort>
 void
-__pattern_sort(__parallel_tag<_IsVector>, _ExecutionPolicy&& __exec, _RandomAccessIterator __first,
+__pattern_sort(__parallel_tag<_IsVector> __tag, _ExecutionPolicy&& __exec, _RandomAccessIterator __first,
                _RandomAccessIterator __last, _Compare __comp, _LeafSort __leaf_sort)
 {
     using __backend_tag = typename __parallel_tag<_IsVector>::__backend_tag;
 
-    __internal::__except_handler([&]() {
-        __par_backend::__parallel_stable_sort(
-            __backend_tag{}, ::std::forward<_ExecutionPolicy>(__exec), __first, __last, __comp,
-            [__leaf_sort](_RandomAccessIterator __first, _RandomAccessIterator __last, _Compare __comp) {
-                __leaf_sort(__first, __last, __comp);
-            },
-            __last - __first);
-    });
+    if constexpr (_IsVector::value && __unseq_backend::__is_simd_sort_applicable<_RandomAccessIterator, _Compare>())
+    {
+        using _Tp = typename std::iterator_traits<_RandomAccessIterator>::value_type;
+        using _Order = typename __unseq_backend::__simd_sort_order_of<_Compare, _Tp>::type;
+        __internal::__except_handler([&]() {
+            __internal::__parallel_simd_sort(__tag, std::forward<_ExecutionPolicy>(__exec),
+                                             __unseq_backend::__simd_sort_to_address(__first), __last - __first,
+                                             _Order{});
+        });
+    }
+    else
+    {
+        __internal::__except_handler([&]() {
+            __par_backend::__parallel_stable_sort(
+                __backend_tag{}, ::std::forward<_ExecutionPolicy>(__exec), __first, __last, __comp,
+                [__leaf_sort](_RandomAccessIterator __first, _RandomAccessIterator __last, _Compare __comp) {
+                    __leaf_sort(__first, __last, __comp);
+                },
+                __last - __first);
+        });
+    }
 }
 
 //------------------------------------------------------------------------
